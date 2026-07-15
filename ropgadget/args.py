@@ -102,8 +102,14 @@ architectures supported:
         parser.add_argument("--silent",             action="store_true",              help="Disables printing of gadgets during analysis")
         parser.add_argument("--align",              type=int,                         help="Align gadgets addresses (in bytes)")
         parser.add_argument("--mipsrop",            type=str, metavar="<rtype>",      help="MIPS useful gadgets finder stackfinder|system|tails|lia0|registers")
+        parser.add_argument("--rv-cf-filter",       type=str, metavar="<cats>",       help="RISC-V only: suppress gadgets ending in the given control-flow categories, by number (8-16) or name, separated by '|' or ',' (e.g. \"8|13\" or \"indirect-call|function-return\"). Categories: 8=indirect-call 9=direct-call 10=indirect-jump 11=direct-jump 12=coroutine-swap 13=function-return 14=other-indirect-linkage 15=other-direct-linkage 16=syscall")
 
         self.__args = parser.parse_args(arguments)
+
+        if self.__args.rv_cf_filter:
+            from ropgadget.gadgets import parseRiscvCFCategories
+            # Validate category tokens up front so typos fail fast.
+            parseRiscvCFCategories(self.__args.rv_cf_filter)
 
         if self.__args.noinstr and self.__args.only:
             raise ValueError("[Error] --noinstr and --only=<key> can't be used together")

@@ -13,6 +13,8 @@ from struct import pack
 
 from capstone import *
 
+from ropgadget.gadgets import RISCV_CALL_CATEGORIES, RISCV_CF_CATEGORIES, parseRiscvCFCategories, riscvClassifyCF
+
 
 class Options(object):
     def __init__(self, options, binary, gadgets):
@@ -30,6 +32,8 @@ class Options(object):
             self.__deleteBadBytes()
         if options.callPreceded:
             self.__removeNonCallPreceded()
+        if getattr(options, "rv_cf_filter", None):
+            self.__riscvFilterCF()
 
     def __onlyOption(self):
         new = []
@@ -98,7 +102,7 @@ class Options(object):
         self.__gadgets = new
 
     def __removeNonCallPreceded(self):
-        def __isGadgetCallPreceded(gadget):
+        def __isGadgetCallPrecededX86(gadget):
             # Given a gadget, determine if the bytes immediately preceding are a call instruction
             prevBytes = gadget["prev"]
             # TODO: Improve / Semantically document each of these cases.
@@ -111,13 +115,50 @@ class Options(object):
                 b"\xff[\x00-\xff][\x00-\xff][\x00-\xff][\x00-\xff][\x00-\xff][\x00-\xff][\x00-\xff][\x00-\xff]$",
             ]
             return bool(reduce(lambda x, y: x or y, map(lambda x: re.search(x, prevBytes), callPrecededExpressions)))
+
+        def __isGadgetCallPrecededRISCV(gadget):
+            # Call-preceded on RISC-V: the instruction immediately preceding the gadget
+            # writes a link register (jal/jalr/c.jalr with rd in {ra, t0}), i.e. it pushes
+            # a return address -- so the gadget's address is a legitimate return target.
+            prevBytes = gadget["prev"]
+            endian = "big" if self.__binary.getEndian() == CS_MODE_BIG_ENDIAN else "little"
+            # The preceding instruction is either 4 bytes (jal/jalr) or 2 bytes (c.jalr).
+            for size in (4, 2):
+                if len(prevBytes) >= size:
+                    word = int.from_bytes(prevBytes[-size:], endian)
+                    if riscvClassifyCF(word, size) in RISCV_CALL_CATEGORIES:
+                        return True
+            return False
+
         arch = self.__binary.getArch()
         if arch == CS_ARCH_X86:
-            initial_length = len(self.__gadgets)
-            self.__gadgets = list(filter(__isGadgetCallPreceded, self.__gadgets))
-            print("Options().removeNonCallPreceded(): Filtered out {} gadgets.".format(initial_length - len(self.__gadgets)))
+            predicate = __isGadgetCallPrecededX86
+        elif arch == CS_ARCH_RISCV:
+            predicate = __isGadgetCallPrecededRISCV
         else:
             print("Options().removeNonCallPreceded(): Unsupported architecture.")
+            return
+
+        initial_length = len(self.__gadgets)
+        self.__gadgets = list(filter(predicate, self.__gadgets))
+        print("Options().removeNonCallPreceded(): Filtered out {} gadgets.".format(initial_length - len(self.__gadgets)))
+
+    def __riscvFilterCF(self):
+        if self.__binary.getArch() != CS_ARCH_RISCV:
+            print("Options().riscvFilterCF(): Unsupported architecture (RISC-V only).")
+            return
+        try:
+            categories = parseRiscvCFCategories(self.__options.rv_cf_filter)
+        except ValueError as e:
+            print(str(e))
+            return
+        if not categories:
+            return
+        initial_length = len(self.__gadgets)
+        self.__gadgets = [g for g in self.__gadgets if g.get("cfcat") not in categories]
+        names = ", ".join(RISCV_CF_CATEGORIES[c][0] for c in sorted(categories))
+        print("Options().riscvFilterCF(): Filtered out {} gadgets ({}).".format(
+            initial_length - len(self.__gadgets), names))
 
     def __deleteBadBytes(self):
         if not self.__options.badbytes:

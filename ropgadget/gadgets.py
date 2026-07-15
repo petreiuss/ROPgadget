@@ -21,6 +21,126 @@ except NameError:
     from capstone import CS_ARCH_AARCH64 as CS_ARCH_ARM64
 
 
+# RISC-V control-flow gadget taxonomy (terminating instruction of a gadget).
+# Numbers/names are the categories a gadget may be filtered on via --rv-cf-filter.
+RISCV_CF_CATEGORIES = {
+    8:  ("indirect-call",          "Indirect call"),
+    9:  ("direct-call",            "Direct call"),
+    10: ("indirect-jump",          "Indirect jump (without linkage)"),
+    11: ("direct-jump",            "Direct jump (without linkage)"),
+    12: ("coroutine-swap",         "Co-routine swap"),
+    13: ("function-return",        "Function return"),
+    14: ("other-indirect-linkage", "Other indirect jump (with linkage)"),
+    15: ("other-direct-linkage",   "Other direct jump (with linkage)"),
+    16: ("syscall",                "Environment call (ecall)"),
+}
+
+# Categories whose instruction writes a link register (i.e. pushes a return
+# address onto the RAS). An address immediately following one of these is a
+# legitimate return target, which is exactly what "call-preceded" means.
+RISCV_CALL_CATEGORIES = frozenset((8, 9, 12, 14, 15))
+
+# Link registers per the RISC-V return-address-stack (RAS) hint rules: x1 (ra), x5 (t0).
+_RISCV_LINK_REGS = (1, 5)
+
+# Every RISC-V control-transfer mnemonic as rendered by Capstone (including
+# pseudo-instructions). A basic-block gadget has exactly one of these and it is
+# the terminator; any earlier occurrence is an interior branch that ends the
+# block, so the gadget must be rejected unless --multibr is set.
+RISCV_TRANSFER_MNEMONICS = frozenset((
+    # direct jumps / calls
+    "j", "jal", "call", "tail", "c.j", "c.jal",
+    # indirect jumps / calls / returns
+    "jr", "jalr", "ret", "c.jr", "c.jalr", "c.ret",
+    # conditional branches (base + pseudo forms)
+    "beq", "bne", "blt", "bge", "bltu", "bgeu",
+    "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
+    "bgt", "ble", "bgtu", "bleu",
+    "c.beqz", "c.bnez",
+    # environment / trap-based transfers
+    "ecall", "ebreak", "c.ebreak", "mret", "sret", "uret", "dret",
+))
+
+
+def _riscvRasCategory(rd_link, rs1_link, rd_eq_rs1):
+    # Register-indirect transfers (jalr and its compressed forms), classified by the
+    # RAS action table from the RISC-V ISA:
+    #   rd link | rs1 link | rs1 == rd | RAS action     | category
+    #   no        no         -           none            10 indirect jump (no linkage)
+    #   no        yes        -           pop             13 function return
+    #   yes       no         -           push            8  indirect call
+    #   yes       yes        no          pop, then push  12 co-routine swap
+    #   yes       yes        yes         push            14 other indirect jump (with linkage)
+    if not rd_link and not rs1_link:
+        return 10
+    if not rd_link and rs1_link:
+        return 13
+    if rd_link and not rs1_link:
+        return 8
+    if rd_eq_rs1:
+        return 14
+    return 12
+
+
+def riscvClassifyCF(word, size):
+    """Classify a RISC-V control-transfer instruction word into one of the forward/
+    backward-edge categories in RISCV_CF_CATEGORIES. Returns None for instructions
+    that are not unconditional calls/jumps (conditional branches, ecall, ...)."""
+    if size == 4:
+        opcode = word & 0x7f
+        if opcode == 0x6f:                                  # JAL rd, imm
+            rd = (word >> 7) & 0x1f
+            return 9 if rd in _RISCV_LINK_REGS else 11
+        if opcode == 0x67 and ((word >> 12) & 0x7) == 0:    # JALR rd, rs1, imm
+            rd  = (word >> 7) & 0x1f
+            rs1 = (word >> 15) & 0x1f
+            return _riscvRasCategory(rd in _RISCV_LINK_REGS, rs1 in _RISCV_LINK_REGS, rd == rs1)
+        if opcode == 0x73 and ((word >> 12) & 0x7) == 0 and ((word >> 20) & 0xfff) == 0:  # ECALL
+            return 16
+        return None                                         # branch / other
+    if size == 2:
+        op = word & 0x3
+        funct3 = (word >> 13) & 0x7
+        if op == 0x1:                                       # op=01 quadrant (C.J / C.BEQZ / C.ADDIW / ...)
+            if funct3 == 0x5:                               # C.J -> jal x0, imm
+                return 11
+            # NB: funct3=001 here is C.ADDIW on RV64 (C.JAL only on RV32); this tool always
+            # disassembles as RV64, so it is not a control transfer. C.BEQZ/C.BNEZ are branches.
+            return None
+        if op == 0x2 and funct3 == 0x4:                     # C.JR / C.JALR / C.MV / C.ADD
+            bit12 = (word >> 12) & 0x1
+            rs1   = (word >> 7) & 0x1f
+            rs2   = (word >> 2) & 0x1f
+            if rs2 != 0 or rs1 == 0:
+                return None                                 # C.MV / C.ADD / reserved / C.EBREAK
+            if bit12 == 0:                                  # C.JR rs1   -> jalr x0, rs1, 0
+                return _riscvRasCategory(False, rs1 in _RISCV_LINK_REGS, False)
+            return _riscvRasCategory(True, rs1 in _RISCV_LINK_REGS, rs1 == 1)  # C.JALR rs1 -> jalr ra, rs1, 0
+        return None
+    return None
+
+
+def parseRiscvCFCategories(spec):
+    """Parse a '|'- or ','-separated list of RISC-V control-flow categories (numbers
+    8..15 and/or names) into a set of category numbers. Raises ValueError on unknowns."""
+    if not spec:
+        return set()
+    name_to_num = {name: num for num, (name, _desc) in RISCV_CF_CATEGORIES.items()}
+    result = set()
+    for tok in re.split(r"[|,]", spec):
+        tok = tok.strip().lower()
+        if not tok:
+            continue
+        if tok.isdigit() and int(tok) in RISCV_CF_CATEGORIES:
+            result.add(int(tok))
+        elif tok in name_to_num:
+            result.add(name_to_num[tok])
+        else:
+            raise ValueError("[Error] Unknown RISC-V control-flow category '{}' "
+                             "(expected 8-16 or a name from --help)".format(tok))
+    return result
+
+
 class Gadgets(object):
     def __init__(self, binary, options, offset):
         self.__binary  = binary
@@ -52,6 +172,17 @@ class Gadgets(object):
 
         return False
 
+    def __passCleanRISCV(self, decodes):
+        # The terminator must be a control transfer.
+        if decodes[-1][2] not in RISCV_TRANSFER_MNEMONICS:
+            return True
+        # Enforce single-exit (basic-block) gadgets: reject any interior control
+        # transfer, unless the user opts into multi-branch gadgets with --multibr.
+        if not self.__options.multibr and any(mnemonic in RISCV_TRANSFER_MNEMONICS for _, _, mnemonic, _ in decodes[:-1]):
+            return True
+
+        return False
+
     def __gadgetsFinding(self, section, gadgets, arch, mode):
 
         PREV_BYTES = 9  # Number of bytes prior to the gadget to store.
@@ -61,6 +192,7 @@ class Gadgets(object):
         ret = []
         md = Cs(arch, mode)
         op_len = len(opcodes)
+        big_endian = self.__binary.getEndian() == CS_MODE_BIG_ENDIAN
 
         for gad_op, gad_size, gad_align in gadgets:
             if self.__options.align:
@@ -124,6 +256,12 @@ class Gadgets(object):
                         g["prev"] = opcodes[pstart:pend]
                     if self.__options.dump:
                         g["bytes"] = code
+                    if arch == CS_ARCH_RISCV:
+                        # Classify the gadget's terminating control-transfer instruction
+                        # (last decoded insn) so it can be filtered with --rv-cf-filter.
+                        term_size = decodes[-1][1]
+                        word = int.from_bytes(code[-term_size:], "big" if big_endian else "little")
+                        g["cfcat"] = riscvClassifyCF(word, term_size)
                     ret.append(g)
         return ret
 
@@ -490,6 +628,9 @@ class Gadgets(object):
             return True
 
         if self.__arch == CS_ARCH_X86 and self.__passCleanX86(decodes):
+            return True
+
+        if self.__arch == CS_ARCH_RISCV and self.__passCleanRISCV(decodes):
             return True
 
         if self.__filterRE and any(self.__filterRE.match(mnemonic) for _, _, mnemonic, _ in decodes):

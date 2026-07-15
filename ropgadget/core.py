@@ -488,6 +488,7 @@ class Core(cmd.Cmd):
         print("String:      %s" % self.__options.string)
         print("Thumb:       %s" % self.__options.thumb)
         print("Mipsrop:     %s" % self.__options.mipsrop)
+        print("RvCFFilter:  %s" % getattr(self.__options, "rv_cf_filter", None))
 
     def help_settings(self):
         print("Display setting's environment")
@@ -634,6 +635,23 @@ class Core(cmd.Cmd):
 
     def help_all(self):
         print("Syntax: all <enable|disable - Show all gadgets (disable removing duplicate gadgets)")
+        return False
+
+    def do_rvcffilter(self, s, silent=False):
+        if s.lower() == "none":
+            self.__options.rv_cf_filter = None
+        elif s == "":
+            return self.help_rvcffilter()
+        else:
+            self.__options.rv_cf_filter = s.split()[0]
+
+        if not silent:
+            print("[+] RISC-V control-flow filter setted. You have to reload gadgets")
+
+    def help_rvcffilter(self):
+        print("Syntax: rvcffilter <cat1|cat2|...> - RISC-V only: suppress gadgets ending in the")
+        print("given control-flow categories, by number (8-16) or name (e.g. 8|13 or")
+        print("indirect-call|function-return|syscall). 'none' clears the filter.")
         return False
 
     def help_re(self):
